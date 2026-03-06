@@ -34,7 +34,7 @@ from aiogram.dispatcher.middlewares.base import BaseMiddleware
 
 
 # ===================== CONFIG =====================
-BOT_TOKEN = "7013989951:AAEeJrupxP5FI9XAbUnvbEJhvjH6wcjXewU"  # ⚠️ BotFather -> /revoke -> yangi token qo'ying
+BOT_TOKEN = "8699119508:AAHqgX_HPd4Uf7y0BGjWwjknONz63Gus5ME"  # ⚠️ BotFather -> /revoke -> yangi token qo'ying
 ADMIN_ID = 6551039574
 ACADEMY_NAME = "Smart Edu Center"
 CERT_LOGO_PATH = "assets/logo.png"       # loyihangizda shu fayl bo‘lsin
