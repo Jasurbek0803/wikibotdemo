@@ -11,6 +11,8 @@ import time
 import re
 import os
 import tempfile
+import random
+import string
 from datetime import datetime, timezone, timedelta, date, time as dtime
 from collections import defaultdict, deque
 
@@ -21,7 +23,7 @@ from openpyxl.utils import get_column_letter
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -32,14 +34,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 
-
 # ===================== CONFIG =====================
 BOT_TOKEN = "8699119508:AAHqgX_HPd4Uf7y0BGjWwjknONz63Gus5ME"  # ⚠️ BotFather -> /revoke -> yangi token qo'ying
 ADMIN_ID = 6551039574
 ACADEMY_NAME = "Smart Edu Center"
-CERT_LOGO_PATH = "assets/logo.png"       # loyihangizda shu fayl bo‘lsin
-CERT_SIGN_PATH = "assets/sign.png"       # imzo rasmi (PNG)
-CERT_MIN_PERCENT = 60.0                  # oddiy testlarda threshold
+CERT_LOGO_PATH = "assets/logo.png"  # loyihangizda shu fayl bo‘lsin
+CERT_SIGN_PATH = "assets/sign.png"  # imzo rasmi (PNG)
+CERT_MIN_PERCENT = 50.0  # Barcha testlar uchun threshold (50% ga tushirildi)
 # ===================== PAYMENT CONFIG =====================
 PAYMENT_CARD = "9860 0121 0681 0950"
 PAYMENT_OWNER = "Jasurbek Aktamov"
@@ -64,7 +65,6 @@ STRIKE_RESET_AFTER_SEC = 24 * 3600
 # Countdown (reverse timer)
 COUNTDOWN_TICK_SEC = 60  # 60s
 
-
 # ===================== UI TEXT =====================
 BTN_FREE = "🆓 Tekin testlar"
 BTN_PAID = "🧾 Pullik testlar"
@@ -73,10 +73,15 @@ BTN_RATING = "🏆 Reyting"
 BTN_RESULTS = "📄 Natijalarim"
 BTN_HELP = "ℹ️ Yordam"
 
-BTN_ADMIN_ADD = "➕ Test Qo'shish (Admin)"
+BTN_ADD_TEST = "➕ Test Yaratish"
+BTN_MY_CREATED_TESTS = "🛠 Yaratgan testlarim"
+
 BTN_ADMIN_PENDING = "🟡 Pending to'lovlar (Admin)"
 BTN_ADMIN_STATS = "📊 Statistika (Admin)"
 BTN_ADMIN_CHANNELS = "📣 Majburiy kanallar (Admin)"  # ✅ NEW
+BTN_ADMIN_DEL_TEST = "🗑 Testni o'chirish (Admin)"
+BTN_ADMIN_ADD_ADMIN = "👮 Adminlarni boshqarish"
+BTN_PROFILE = "👤 Profilim"
 
 BTN_HOME = "🏠 Bosh menyu"
 BTN_BACK = "⬅️ Ortga"
@@ -84,7 +89,9 @@ BTN_CANCEL = "Bekor qilish"
 
 TOP_MENU_BTNS = {
     BTN_FREE, BTN_PAID, BTN_MY, BTN_RATING, BTN_RESULTS, BTN_HELP,
-    BTN_ADMIN_ADD, BTN_ADMIN_PENDING, BTN_ADMIN_STATS, BTN_ADMIN_CHANNELS,
+    BTN_ADD_TEST, BTN_MY_CREATED_TESTS,
+    BTN_ADMIN_PENDING, BTN_ADMIN_STATS, BTN_ADMIN_CHANNELS,
+    BTN_ADMIN_DEL_TEST, BTN_ADMIN_ADD_ADMIN,
     BTN_HOME, BTN_BACK, BTN_CANCEL
 }
 
@@ -93,6 +100,11 @@ TOP_MENU_BTNS = {
 class RegistrationState(StatesGroup):
     full_name = State()
     phone = State()
+
+
+class EditProfileState(StatesGroup):
+    waiting_name = State()
+    waiting_phone = State()
 
 
 class PaymentState(StatesGroup):
@@ -132,10 +144,15 @@ class SearchByCodeState(StatesGroup):
 
 # ✅ NEW: Admin channels management
 class AdminChannelState(StatesGroup):
-    waiting_channel_ref = State()   # @username yoki -100...
-    waiting_join_url = State()      # optional
-    edit_id = State()               # which row to edit
+    waiting_channel_ref = State()  # @username yoki -100...
+    waiting_join_url = State()  # optional
+    edit_id = State()  # which row to edit
     waiting_edit_payload = State()  # 2 lines: title + link
+
+
+class AdminManageState(StatesGroup):
+    waiting_test_code_to_del = State()
+    waiting_admin_id = State()
 
 
 # ===================== HELPERS =====================
@@ -178,7 +195,7 @@ def normalize_answers(ans: str) -> str:
 
 
 def is_answer_string_valid(ans: str) -> bool:
-    return bool(re.fullmatch(r"[a-z]+", ans))
+    return bool(re.fullmatch(r"[a-z\*]+", ans))  # * belgisi o'tkazib yuborilganlarga ruxsat
 
 
 def parse_date(date_str: str):
@@ -206,17 +223,19 @@ def to_start_ts(date_str: str, time_str: str) -> tuple[int, str] | None:
     dt_local = datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=TZ)
     start_at = dt_local.strftime("%Y-%m-%d %H:%M")
     return int(dt_local.timestamp()), start_at
+
+
 def is_certificate_eligible(exam_type: str, percent: float, grade: str | None) -> bool:
-    et = (exam_type or "simple")
-    if et in ("rasch", "maxsus"):
-        return grade is not None
+    # Barcha turdagi testlar uchun threshold (50%)
     return float(percent or 0.0) >= float(CERT_MIN_PERCENT)
+
 
 async def get_user_full_name(user_id_db: int) -> str:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT full_name FROM users WHERE id=?", (user_id_db,)) as cur:
             row = await cur.fetchone()
     return (row[0] if row and row[0] else "Noma'lum")
+
 
 async def get_test_meta_for_certificate(test_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -225,6 +244,7 @@ async def get_test_meta_for_certificate(test_id: int):
             FROM tests WHERE id=?
         """, (test_id,)) as cur:
             return await cur.fetchone()
+
 
 async def is_admin_user(telegram_id: int) -> bool:
     if telegram_id == ADMIN_ID:
@@ -275,6 +295,7 @@ def is_scheduled_not_started(start_mode: str, start_ts_val: int | None) -> tuple
         return (True, diff)
     return (False, 0)
 
+
 def is_scheduled_expired(start_mode: str, start_ts_val: int | None, duration_min: int | None) -> tuple[bool, int]:
     """
     Returns (expired, seconds_after_end)
@@ -294,146 +315,158 @@ def is_scheduled_expired(start_mode: str, start_ts_val: int | None, duration_min
         return (True, diff)
     return (False, 0)
 
+
 def make_certificate_pdf(
-    full_name: str,
-    subject: str,
-    test_code: str,
-    test_title: str,
-    exam_date_str: str,
-    percent: float = 0.0,
-    correct_count: int = 0,
-    total_questions: int = 0,
-    rasch_ball: float | None = None,
-    grade: str | None = None,
-    out_path: str = "certificate.pdf"
+        full_name: str,
+        subject: str,
+        test_code: str,
+        test_title: str,
+        exam_date_str: str,
+        percent: float = 0.0,
+        correct_count: int = 0,
+        total_questions: int = 0,
+        rasch_ball: float | None = None,
+        grade: str | None = None,
+        out_path: str = "certificate.pdf"
 ):
     """
-    CHIROYLI ALBOMNIY (LANDSCAPE) SERTIFIKAT
+    TANTANAVOR VA PREMIUM ALBOMNIY SERTIFIKAT
     """
-    # Landscape A4 (842 × 595 pt)
     page = landscape(A4)
     c = canvas.Canvas(out_path, pagesize=page)
     w, h = page
 
-    # ================== ORQA FON (agar bersangiz) ==================
-    # try:
-    #     bg = ImageReader("assets/cert_background.jpg")   # o'zingizning nomingiz
-    #     c.drawImage(bg, 0, 0, width=w, height=h, preserveAspectRatio=True, mask="auto")
-    # except:
-    #     pass
-
     # ================== RAMKALAR ==================
-    # Tashqi oltin ramka
-    c.setStrokeColor(HexColor("#D4AF37"))  # oltin
-    c.setLineWidth(10)
+    # Tashqi qalin oltin ramka
+    c.setStrokeColor(HexColor("#D4AF37"))  # Oltin rang
+    c.setLineWidth(12)
     c.rect(20, 20, w - 40, h - 40)
 
-    # Ichki ko‘k ramka
+    # Ichki to'q ko'k ramka
     c.setStrokeColor(HexColor("#1a2a6c"))
-    c.setLineWidth(4)
-    c.rect(45, 45, w - 90, h - 90)
+    c.setLineWidth(3)
+    c.rect(38, 38, w - 76, h - 76)
+
+    # Eng ichki ingichka oltin chiziq (Premium effekt uchun)
+    c.setStrokeColor(HexColor("#D4AF37"))
+    c.setLineWidth(1)
+    c.rect(44, 44, w - 88, h - 88)
 
     # ================== LOGO ==================
     try:
         if CERT_LOGO_PATH and os.path.exists(CERT_LOGO_PATH):
             logo = ImageReader(CERT_LOGO_PATH)
-            c.drawImage(logo, 65, h - 145, width=120, height=120, mask="auto")
+            c.drawImage(logo, 65, h - 150, width=110, height=110, mask="auto")
     except:
         pass
 
     # ================== SARLAVHA ==================
-    c.setFont("Helvetica-Bold", 55)
+    c.setFont("Times-Bold", 55)
     c.setFillColor(HexColor("#1a2a6c"))
-    c.drawCentredString(w/2, h - 105, "SERTIFIKAT")
+    c.drawCentredString(w / 2, h - 110, "S E R T I F I K A T")
 
-    c.setFont("Helvetica", 19)
+    c.setFont("Times-Italic", 18)
     c.setFillColor(HexColor("#555555"))
-    c.drawCentredString(w/2, h - 145, f"{ACADEMY_NAME} tomonidan taqdim etiladi")
+    c.drawCentredString(w / 2, h - 145, f"Ushbu hujjat {ACADEMY_NAME} tomonidan")
 
-    # ================== ISMI ==================
-    c.setFont("Helvetica-Bold", 32)
+    # ================== ISMI (Tantanavor) ==================
+    display_name = full_name.title() if full_name else "Noma'lum"
+    c.setFont("Times-BoldItalic", 42)
+    c.setFillColor(HexColor("#8B0000"))  # To'q qizil (Bordo)
+    c.drawCentredString(w / 2, h - 215, display_name)
+
+    # ================== MATN ==================
+    c.setFont("Times-Roman", 18)
     c.setFillColor(black)
-    c.drawCentredString(w/2, h - 205, full_name.upper())
+    c.drawCentredString(w / 2, h - 255, "ga o'quv dasturi doirasidagi test sinovlarida muvaffaqiyatli qatnashib,")
+    c.drawCentredString(w / 2, h - 280, "qayd etgan yuqori natijasi va ilm yo'lidagi intiluvchanligi uchun")
 
-    c.setFont("Helvetica", 15)
-    c.drawCentredString(w/2, h - 240, "ga Ushbu sertifikat quyidagi yutug'i uchun berildi")
+    c.setFont("Times-Roman", 18)
+    c.setFillColor(black)  # qora
+    c.drawCentredString(w / 2, h - 310, "taqdim etiladi")
 
     # ================== BATAFSIL MA'LUMOTLAR ==================
-    y = h - 290
-    lh = 32  # line height
+    y = h - 360
+    lh = 30  # Qatorlar orasidagi masofa
 
-    c.setFont("Helvetica-Bold", 17)
-    c.drawString(95, y, "Fan:")
-    c.setFont("Helvetica", 17)
-    c.drawString(247, y, subject)
-
-    y -= lh
-    c.setFont("Helvetica-Bold", 17)
-    c.drawString(95, y, "Test nomi:")
-    c.setFont("Helvetica", 17)
-    c.drawString(247, y, test_title)
+    c.setFont("Times-Bold", 16)
+    c.setFillColor(HexColor("#1a2a6c"))
+    c.drawRightString(w / 2 - 10, y, "Fan:")
+    c.setFont("Times-Roman", 16)
+    c.setFillColor(black)
+    c.drawString(w / 2 + 10, y, subject)
 
     y -= lh
-    c.setFont("Helvetica-Bold", 17)
-    c.drawString(95, y, "Test kodi:")
-    c.setFont("Helvetica", 17)
-    c.drawString(247, y, test_code)
+    c.setFont("Times-Bold", 16)
+    c.setFillColor(HexColor("#1a2a6c"))
+    c.drawRightString(w / 2 - 10, y, "Test nomi:")
+    c.setFont("Times-Roman", 16)
+    c.setFillColor(black)
+    c.drawString(w / 2 + 10, y, test_title)
 
     y -= lh
-    c.setFont("Helvetica-Bold", 17)
-    c.drawString(95, y, "Topshirilgan sana: ")
-    c.setFont("Helvetica", 17)
-    c.drawString(247, y, exam_date_str)
+    c.setFont("Times-Bold", 16)
+    c.setFillColor(HexColor("#1a2a6c"))
+    c.drawRightString(w / 2 - 10, y, "Topshirilgan sana:")
+    c.setFont("Times-Roman", 16)
+    c.setFillColor(black)
+    c.drawString(w / 2 + 10, y, exam_date_str)
 
     # ================== NATIJA BLOKI ==================
-    y = h - 430
-    c.setFont("Helvetica-Bold", 22)
+    y -= lh
+    c.setFont("Times-Bold", 16)
     c.setFillColor(HexColor("#006400"))  # yashil
-    c.drawCentredString(w/2, y, f"NATIJA: {correct_count}/{total_questions}  —  {percent:.1f}%")
+    c.drawCentredString(w / 2 - 10, y, f"NATIJA: {correct_count} / {total_questions}   —   {percent:.1f}%")
 
     if grade:
-        c.setFont("Helvetica-Bold", 38)
+        c.setFont("Times-Bold", 36)
         c.setFillColor(HexColor("#D4AF37"))
-        c.drawCentredString(w/2, y - 65, f"BAHO: {grade}")
+        c.drawCentredString(w / 2, y - 45, f"BAHO: {grade}")
 
     if rasch_ball is not None:
-        c.setFont("Helvetica", 16)
+        c.setFont("Times-Italic", 18)
         c.setFillColor(black)
-        c.drawCentredString(w/2, y - 105, f"Rasch ball: {rasch_ball:.1f}")
+        c.drawCentredString(w / 2, y - 75, f"Rasch ball: {rasch_ball:.1f}")
 
     # ================== IMZO VA MUHR ==================
-    sign_y = 108
+    sign_y = 115
 
-    # Chap tomonda imzo
-    c.setFont("Helvetica-Bold", 15)
-    c.drawString(95, sign_y - 48, "Direktor: Po'latov J.")
+    c.setFont("Times-BoldItalic", 16)
+    c.setFillColor(black)
+    c.drawString(95, sign_y - 20, "Mas'ul shaxs:")
+
+    c.setFont("Times-Bold", 16)
+    c.drawString(230, sign_y - 20, "J.Aktamov")
+
+    c.setStrokeColor(black)
+    c.setLineWidth(1)
+    c.line(95, sign_y - 25, 330, sign_y - 25)
 
     try:
         if CERT_SIGN_PATH and os.path.exists(CERT_SIGN_PATH):
             sign = ImageReader(CERT_SIGN_PATH)
-            c.drawImage(sign, w - 280, sign_y - 38, width=190, height=75, mask="auto")
+            c.drawImage(sign, w - 220, sign_y - 45, width=190, height=75, mask="auto")
     except:
         pass
 
-
-
-    # Pastki yozuv
-    c.setFont("Helvetica", 10)
+    # ================== PASTKI YOZUV ==================
+    c.setFont("Times-Roman", 11)
     c.setFillColor(HexColor("#666666"))
-    c.drawCentredString(w/2, 32, "© 2026 Smart Edu Center • Raqamli imzo bilan tasdiqlangan")
+    c.drawCentredString(w / 2, 65, f"© 2026 {ACADEMY_NAME} • Raqamli imzo bilan tasdiqlangan")
+    c.drawCentredString(w / 2, 50, f"Hujjatni tasdiqlovchi kod: {test_code}")
 
     c.showPage()
     c.save()
+
 
 # ===================== RUSH MODULE (Finalize after exam end) =====================
 
 
 # === NEW: Rasch stabilizatsiya sozlamalari ===
-RUSH_SMALL_N = 20        # <=20 bo'lsa "kichik guruh" rejimi
-RUSH_LARGE_N = 50        # >=50 bo'lsa "katta guruh" rejimi (hozirgi percentile ishlaydi)
+RUSH_SMALL_N = 20  # <=20 bo'lsa "kichik guruh" rejimi
+RUSH_LARGE_N = 50  # >=50 bo'lsa "katta guruh" rejimi (hozirgi percentile ishlaydi)
 # === NEW: Juda kichik N uchun to'liq fallback ===
-RUSH_HARD_FALLBACK_N = 6   # <= 6 qatnashuvchi bo'lsa Rasch emas, oddiy foizdan ball
-
+RUSH_HARD_FALLBACK_N = 6  # <= 6 qatnashuvchi bo'lsa Rasch emas, oddiy foizdan ball
 
 # p smoothing (Bayes) parametrlari: p = (correct + A) / (total + A + B)
 RUSH_SMOOTH_A = 1.0
@@ -441,11 +474,11 @@ RUSH_SMOOTH_B = 1.0
 
 # kichik guruhda theta->ball rescale uchun barqaror diapazon
 RUSH_FIXED_LO = -3.0
-RUSH_FIXED_HI =  3.0
+RUSH_FIXED_HI = 3.0
 
 # b_list ni haddan tashqari ketib qolmasligi uchun clamp
 B_MIN = -4.0
-B_MAX =  4.0
+B_MAX = 4.0
 
 
 # ===================== RASCH (RUSH) MODULE - FIXED =====================
@@ -469,10 +502,12 @@ def grade_from_rasch_ball(ball: float) -> str | None:
         return "C"
     return None  # <= 45.9 -> umuman daraja yo'q (sertifikat bermasligi mumkin)
 
+
 import math
 
 THETA_MIN = -6.0
 THETA_MAX = 6.0
+
 
 def _sigmoid(x: float) -> float:
     if x >= 35:
@@ -481,12 +516,16 @@ def _sigmoid(x: float) -> float:
         return 0.0
     return 1.0 / (1.0 + math.exp(-x))
 
+
 def _clamp(x: float, a: float, b: float) -> float:
     return a if x < a else b if x > b else x
+
 
 def rasch_difficulty_from_p(p: float) -> float:
     p = _clamp(float(p), 0.01, 0.99)
     return math.log((1.0 - p) / p)
+
+
 def rasch_difficulty_from_counts(correct: int, total: int, a: float = RUSH_SMOOTH_A, b: float = RUSH_SMOOTH_B) -> float:
     """
     Kichik N uchun p ni smoothing qilamiz:
@@ -566,6 +605,7 @@ def estimate_theta_rasch(ans: str, key: str, b_list: list[float], iters: int = 2
 
     return theta
 
+
 def rescale_theta_to_75(theta: float, lo: float, hi: float) -> float:
     if hi <= lo + 1e-9:
         return 37.5
@@ -581,6 +621,8 @@ def rasch_ball_from_weighted_ratio(ratio_0_1: float) -> float:
     """
     ratio_0_1 = max(0.0, min(1.0, float(ratio_0_1 or 0.0)))
     return ratio_0_1 * 75.0
+
+
 def fallback_rasch_ball_from_raw_percent(raw_percent_0_100: float) -> float:
     """
     Juda kichik N bo'lsa Raschni ishlatmaymiz.
@@ -588,8 +630,6 @@ def fallback_rasch_ball_from_raw_percent(raw_percent_0_100: float) -> float:
     """
     p = max(0.0, min(100.0, float(raw_percent_0_100 or 0.0)))
     return (p / 100.0) * 75.0
-
-
 
 
 async def get_test_end_ts(test_id: int) -> int:
@@ -600,8 +640,8 @@ async def get_test_end_ts(test_id: int) -> int:
     """
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT start_mode, start_ts, duration FROM tests WHERE id=?",
-            (test_id,)
+                "SELECT start_mode, start_ts, duration FROM tests WHERE id=?",
+                (test_id,)
         ) as cur:
             t = await cur.fetchone()
 
@@ -749,13 +789,15 @@ async def finalize_rush_for_test_if_ready(test_id: int) -> bool:
         return True
 
 
-
 # ===================== MAXSUS MODULE (Rasch-like, but local) =====================
 
-MAXSUS_RELIABILITY_M = 3 # n kichik bo'lsa natijani 50% ga yaqinlashtiradi
+MAXSUS_RELIABILITY_M = 3  # n kichik bo'lsa natijani 50% ga yaqinlashtiradi
+
+
 def _round_half_up(x: float) -> int:
     # 10.5 -> 11 (python round() banker's rounding emas)
     return int(math.floor(x + 0.5))
+
 
 def maxsus_grade_from_k_any(n: int, k: int) -> str | None:
     n = int(n or 0)
@@ -770,7 +812,7 @@ def maxsus_grade_from_k_any(n: int, k: int) -> str | None:
         if 18 <= k <= 21: return "B+"
         if 15 <= k <= 17: return "B"
         if 12 <= k <= 14: return "C+"
-        if 9  <= k <= 11: return "C"
+        if 9 <= k <= 11: return "C"
         return None
 
     if n == 35:
@@ -792,18 +834,18 @@ def maxsus_grade_from_k_any(n: int, k: int) -> str | None:
         return None
 
     # 2) UNIVERSAL (boshqa n lar uchun)
-    c_min   = _round_half_up(0.30 * n)
-    cp_min  = _round_half_up(0.40 * n)
-    b_min   = _round_half_up(0.50 * n)
-    bp_min  = _round_half_up((0.62 if n >= 50 else 0.60) * n)
-    a_min   = _round_half_up(0.72 * n)
-    ap_min  = _round_half_up(0.82 * n)
+    c_min = _round_half_up(0.30 * n)
+    cp_min = _round_half_up(0.40 * n)
+    b_min = _round_half_up(0.50 * n)
+    bp_min = _round_half_up((0.62 if n >= 50 else 0.60) * n)
+    a_min = _round_half_up(0.72 * n)
+    ap_min = _round_half_up(0.82 * n)
 
     # monoton bo'lsin
     cp_min = max(cp_min, c_min + 1)
-    b_min  = max(b_min,  cp_min + 1)
+    b_min = max(b_min, cp_min + 1)
     bp_min = max(bp_min, b_min + 1)
-    a_min  = max(a_min,  bp_min + 1)
+    a_min = max(a_min, bp_min + 1)
     ap_min = max(ap_min, a_min + 1)
 
     if k >= ap_min: return "A+"
@@ -814,6 +856,7 @@ def maxsus_grade_from_k_any(n: int, k: int) -> str | None:
     if k >= c_min:  return "C"
     return None
 
+
 def maxsus_theta_from_score(k: int, n: int) -> float:
     k = int(k)
     n = int(n)
@@ -821,8 +864,10 @@ def maxsus_theta_from_score(k: int, n: int) -> float:
         return 0.0
     return math.log((k + 0.5) / ((n - k) + 0.5))
 
+
 def maxsus_rasch_p(theta: float) -> float:
     return _sigmoid(theta)
+
 
 def maxsus_reliability(n: int, m: int = MAXSUS_RELIABILITY_M) -> float:
     n = int(n)
@@ -830,6 +875,7 @@ def maxsus_reliability(n: int, m: int = MAXSUS_RELIABILITY_M) -> float:
     if n <= 0:
         return 0.0
     return n / (n + m)
+
 
 def maxsus_ball_percent_from_score(k: int, n: int) -> tuple[float, float, float]:
     theta = maxsus_theta_from_score(k, n)
@@ -841,6 +887,7 @@ def maxsus_ball_percent_from_score(k: int, n: int) -> tuple[float, float, float]
     rasch_ball = 75.0 * p_final  # 0..75
     rasch_percent = 100.0 * p_final  # 0..100
     return rasch_ball, rasch_percent, theta
+
 
 async def finalize_maxsus_for_test_if_ready(test_id: int) -> bool:
     end_ts = await get_test_end_ts(test_id)
@@ -903,6 +950,7 @@ async def finalize_maxsus_for_test_if_ready(test_id: int) -> bool:
 
     return True
 
+
 # ===================== REQUIRED CHANNELS (FORCED SUBSCRIPTION) =====================
 def _normalize_channel_ref(text: str) -> str:
     s = (text or "").strip()
@@ -938,7 +986,7 @@ def build_join_kb(channels_rows):
                 url = f"https://t.me/{username}"
             else:
                 url = ""
-        btn_text = f"➕ {title or (('@'+username) if username else str(chat_id))}"
+        btn_text = f"➕ {title or (('@' + username) if username else str(chat_id))}"
         if url:
             kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, url=url)])
     kb.inline_keyboard.append([InlineKeyboardButton(text="✅ A’zo bo‘ldim — Tekshirish", callback_data="chk_sub")])
@@ -954,7 +1002,6 @@ async def check_user_subscribed(bot: Bot, user_id: int) -> tuple[bool, list]:
     for row in rows:
         (_id, chat_id, username, title, join_url, is_active) = row
 
-        # If chat_id is missing but username exists, try to resolve and cache it.
         resolved_chat_id = chat_id
         if not resolved_chat_id and username:
             try:
@@ -963,20 +1010,22 @@ async def check_user_subscribed(bot: Bot, user_id: int) -> tuple[bool, list]:
                 async with aiosqlite.connect(DB_NAME) as db:
                     await db.execute("UPDATE required_channels SET chat_id=? WHERE id=?", (int(resolved_chat_id), _id))
                     await db.commit()
-            except Exception:
+            except Exception as e:
+                logging.error(f"Kanalni topib bo'lmadi: @{username}. Xato: {e}")
                 resolved_chat_id = None
 
         if not resolved_chat_id:
-            # Can't verify membership without a chat_id (private groups/channels require bot to be in the chat).
             not_joined.append(row)
             continue
 
         try:
             member = await bot.get_chat_member(chat_id=int(resolved_chat_id), user_id=user_id)
-            status = getattr(member, "status", None)
-            if status in ("left", "kicked"):
+            # Foydalanuvchi kanal/guruhdan chiqib ketgan yoki haydalgan bo'lsa
+            if member.status in ("left", "kicked"):
                 not_joined.append(row)
-        except Exception:
+        except Exception as e:
+            # Agar bot foydalanuvchini topa olmasa (yoki bot kanalga admin qilinmagan bo'lsa)
+            logging.error(f"A'zolikni tekshirishda xatolik: {e}")
             not_joined.append(row)
 
     return (len(not_joined) == 0), not_joined
@@ -1162,6 +1211,10 @@ async def init_db():
             )
         """)
 
+        # ✅ NEW: Creator ID for tests
+        await _ensure_column(db, "tests", "creator_id", "INTEGER")
+        await _ensure_column(db, "tests", "created_ts", "INTEGER DEFAULT 0")
+
         # ✅ RUSH: tests finalize flags
         await _ensure_column(db, "tests", "rush_finalized", "INTEGER DEFAULT 0")
         await _ensure_column(db, "tests", "rush_finalized_ts", "INTEGER DEFAULT 0")
@@ -1183,10 +1236,6 @@ async def init_db():
         await _ensure_column(db, "results", "grade", "TEXT")
         await _ensure_column(db, "results", "finished_ts", "INTEGER DEFAULT 0")
 
-        # ✅ RUSH: tests finalize flags
-        await _ensure_column(db, "tests", "rush_finalized", "INTEGER DEFAULT 0")
-        await _ensure_column(db, "tests", "rush_finalized_ts", "INTEGER DEFAULT 0")
-
         # migrations for tests
         await _ensure_column(db, "tests", "is_free", "INTEGER DEFAULT 0")
         await _ensure_column(db, "tests", "code", "TEXT")
@@ -1195,7 +1244,6 @@ async def init_db():
         # ✅ RASCH: alohida ustunlar
         await _ensure_column(db, "results", "rasch_ball", "REAL")
         await _ensure_column(db, "results", "rasch_percent", "REAL")
-
 
         # scheduled fields
         await _ensure_column(db, "tests", "start_mode", "TEXT DEFAULT 'normal'")
@@ -1224,8 +1272,8 @@ class SecurityManager:
     async def _get_limit_row(self, user_id: int):
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute(
-                "SELECT strikes, blocked_until_ts, last_violation_ts FROM user_limits WHERE user_tg_id=?",
-                (user_id,),
+                    "SELECT strikes, blocked_until_ts, last_violation_ts FROM user_limits WHERE user_tg_id=?",
+                    (user_id,),
             ) as cur:
                 row = await cur.fetchone()
             if not row:
@@ -1354,12 +1402,13 @@ def main_menu_kb(is_admin=False):
         [KeyboardButton(text=BTN_FREE), KeyboardButton(text=BTN_PAID)],
         [KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_RATING)],
         [KeyboardButton(text=BTN_RESULTS), KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_ADD_TEST), KeyboardButton(text=BTN_MY_CREATED_TESTS)],
+        [KeyboardButton(text=BTN_PROFILE)]
     ]
     if is_admin:
-        buttons.append([KeyboardButton(text=BTN_ADMIN_ADD)])
-        buttons.append([KeyboardButton(text=BTN_ADMIN_PENDING)])
-        buttons.append([KeyboardButton(text=BTN_ADMIN_STATS)])
-        buttons.append([KeyboardButton(text=BTN_ADMIN_CHANNELS)])  # ✅ NEW
+        buttons.append([KeyboardButton(text=BTN_ADMIN_PENDING), KeyboardButton(text=BTN_ADMIN_STATS)])
+        buttons.append([KeyboardButton(text=BTN_ADMIN_CHANNELS), KeyboardButton(text=BTN_ADMIN_DEL_TEST)])
+        buttons.append([KeyboardButton(text=BTN_ADMIN_ADD_ADMIN)])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
@@ -1502,9 +1551,12 @@ async def nav_back(message: Message, state: FSMContext):
     await go_home(message, state)
 
 
-@router.message(StateFilter("*"), F.text.in_({BTN_FREE, BTN_PAID, BTN_MY, BTN_RATING, BTN_RESULTS, BTN_HELP, BTN_ADMIN_ADD, BTN_ADMIN_PENDING, BTN_ADMIN_STATS, BTN_ADMIN_CHANNELS}))
+@router.message(StateFilter("*"), F.text.in_(TOP_MENU_BTNS))
 async def nav_any_section(message: Message, state: FSMContext, bot: Bot):
     # ✅ forced subscription gate (admin bypass is inside)
+    if message.text in (BTN_HOME, BTN_BACK, BTN_CANCEL):
+        return
+
     if not await ensure_subscribed_message(message, bot):
         return
 
@@ -1522,14 +1574,22 @@ async def nav_any_section(message: Message, state: FSMContext, bot: Bot):
         return await my_results(message)
     if message.text == BTN_HELP:
         return await help_menu(message)
-    if message.text == BTN_ADMIN_ADD:
+    if message.text == BTN_ADD_TEST:
         return await admin_add_test(message, state)
+    if message.text == BTN_MY_CREATED_TESTS:
+        return await list_my_created_tests(message)
     if message.text == BTN_ADMIN_PENDING:
         return await admin_pending(message)
     if message.text == BTN_ADMIN_STATS:
         return await admin_stats(message)
     if message.text == BTN_ADMIN_CHANNELS:
         return await admin_channels_panel(message, state)
+    if message.text == BTN_ADMIN_DEL_TEST:
+        return await admin_ask_del_test(message, state)
+    if message.text == BTN_ADMIN_ADD_ADMIN:
+        return await admin_ask_manage_admin(message, state)
+    if message.text == BTN_PROFILE:
+        return await profile_menu(message, state)
 
 
 @router.message(StateFilter("*"), F.text == BTN_CANCEL)
@@ -1567,7 +1627,8 @@ async def process_name(message: Message, state: FSMContext):
     if (message.text or "") in TOP_MENU_BTNS:
         return
     await state.update_data(full_name=message.text.strip())
-    await message.answer("Telefon raqamingizni yuboring:", reply_markup=phone_kb())
+    await message.answer("Telefon raqamingizni yuboring.\nKontaktni yuborish tugmasini bosing:",
+                         reply_markup=phone_kb())
     await state.set_state(RegistrationState.phone)
 
 
@@ -1585,7 +1646,9 @@ async def process_phone(message: Message, state: FSMContext):
         await db.commit()
 
     admin_flag = await is_admin_user(message.from_user.id)
-    await message.answer("✅ Ro'yxatdan o'tish yakunlandi!", reply_markup=main_menu_kb(admin_flag))
+    await message.answer(
+        "✅ Ro'yxatdan o'tish yakunlandi!\n\nAdminlik huquqini olish uchun @raw_info_bot \nbotdan ID ingizni https://t.me/jasur_aktamov ga yuboring",
+        reply_markup=main_menu_kb(admin_flag))
     await state.clear()
 
 
@@ -1651,7 +1714,8 @@ async def handle_code_search(message: Message, state: FSMContext):
             if row:
                 payment_id, status, started_at_paid, reject_reason = row
 
-        async with db.execute("SELECT 1 FROM results WHERE user_id=? AND test_id=? LIMIT 1", (user_db_id, test_id)) as cur:
+        async with db.execute("SELECT 1 FROM results WHERE user_id=? AND test_id=? LIMIT 1",
+                              (user_db_id, test_id)) as cur:
             has_result = bool(await cur.fetchone())
 
     kind = "🆓 Tekin" if is_free == 1 else "🧾 Pullik"
@@ -1702,11 +1766,14 @@ async def handle_code_search(message: Message, state: FSMContext):
     elif scope == "paid":
         if is_free == 0:
             if status == "approved":
-                kb.inline_keyboard.append([InlineKeyboardButton(text="📦 Mening testlarim", callback_data="open_mytests")])
+                kb.inline_keyboard.append(
+                    [InlineKeyboardButton(text="📦 Mening testlarim", callback_data="open_mytests")])
             elif status == "pending":
-                kb.inline_keyboard.append([InlineKeyboardButton(text="🟡 Kutilmoqda", callback_data=f"payinfo_{test_id}")])
+                kb.inline_keyboard.append(
+                    [InlineKeyboardButton(text="🟡 Kutilmoqda", callback_data=f"payinfo_{test_id}")])
             elif status == "rejected":
-                kb.inline_keyboard.append([InlineKeyboardButton(text="♻️ Qayta to‘lov", callback_data=f"rebuy_{test_id}")])
+                kb.inline_keyboard.append(
+                    [InlineKeyboardButton(text="♻️ Qayta to‘lov", callback_data=f"rebuy_{test_id}")])
             else:
                 kb.inline_keyboard.append([InlineKeyboardButton(text="Sotib olish", callback_data=f"buy_{test_id}")])
         else:
@@ -1715,19 +1782,24 @@ async def handle_code_search(message: Message, state: FSMContext):
         if is_free == 0:
             if status == "approved":
                 if has_result:
-                    kb.inline_keyboard.append([InlineKeyboardButton(text="📄 Natijani ko‘rish", callback_data=f"viewres_{test_id}")])
+                    kb.inline_keyboard.append(
+                        [InlineKeyboardButton(text="📄 Natijani ko‘rish", callback_data=f"viewres_{test_id}")])
                 else:
-                    kb.inline_keyboard.append([InlineKeyboardButton(text="🚀 Testni boshlash", callback_data=f"begin_{payment_id}")])
+                    kb.inline_keyboard.append(
+                        [InlineKeyboardButton(text="🚀 Testni boshlash", callback_data=f"begin_{payment_id}")])
                 if started_at_paid:
-                    kb.inline_keyboard.append([InlineKeyboardButton(text="📄 PDF-ni ko‘rish", callback_data=f"pdf_{test_id}")])
+                    kb.inline_keyboard.append(
+                        [InlineKeyboardButton(text="📄 PDF-ni ko‘rish", callback_data=f"pdf_{test_id}")])
             elif status == "pending":
                 kb.inline_keyboard.append([InlineKeyboardButton(text="🟡 Pending", callback_data=f"payinfo_{test_id}")])
             elif status == "rejected":
-                kb.inline_keyboard.append([InlineKeyboardButton(text="♻️ Qayta to‘lov yuborish", callback_data=f"rebuy_{test_id}")])
+                kb.inline_keyboard.append(
+                    [InlineKeyboardButton(text="♻️ Qayta to‘lov yuborish", callback_data=f"rebuy_{test_id}")])
             else:
                 kb.inline_keyboard.append([InlineKeyboardButton(text="Sotib olish", callback_data=f"buy_{test_id}")])
         else:
-            kb.inline_keyboard.append([InlineKeyboardButton(text="🆓 Tekin testlar bo‘limiga o‘ting", callback_data="noop")])
+            kb.inline_keyboard.append(
+                [InlineKeyboardButton(text="🆓 Tekin testlar bo‘limiga o‘ting", callback_data="noop")])
 
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb if kb.inline_keyboard else None)
     await state.clear()
@@ -1736,6 +1808,44 @@ async def handle_code_search(message: Message, state: FSMContext):
 @router.callback_query(F.data == "noop")
 async def noop(callback: CallbackQuery):
     await callback.answer("OK", show_alert=False)
+
+
+# ===================== INTERACTIVE TEST UI (A, B, C, D, E, F) =====================
+def test_ui_kb(current_q: int, qcount: int, answers_dict: dict):
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    current_ans = answers_dict.get(str(current_q))
+
+    # A, B, C qatori (1-qator)
+    row1 = []
+    for letter in ['A', 'B', 'C']:
+        mark = "🟢 " if current_ans == letter.lower() else ""
+        row1.append(InlineKeyboardButton(text=f"{mark}{letter}", callback_data=f"t_ans_{letter.lower()}"))
+    kb.inline_keyboard.append(row1)
+
+    # D, E, F qatori (2-qator)
+    row2 = []
+    for letter in ['D', 'E', 'F']:
+        mark = "🟢 " if current_ans == letter.lower() else ""
+        row2.append(InlineKeyboardButton(text=f"{mark}{letter}", callback_data=f"t_ans_{letter.lower()}"))
+    kb.inline_keyboard.append(row2)
+
+    # Navigatsiya qatori
+    nav = []
+    if current_q > 1:
+        nav.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data="t_nav_prev"))
+
+    nav.append(InlineKeyboardButton(text=f"🔄 {current_q}/{qcount}", callback_data="t_nav_noop"))
+
+    if current_q < qcount:
+        nav.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data="t_nav_next"))
+
+    kb.inline_keyboard.append(nav)
+
+    # Yakunlash qatori
+    answered_count = len(answers_dict)
+    kb.inline_keyboard.append(
+        [InlineKeyboardButton(text=f"✅ Yakunlash ({answered_count}/{qcount})", callback_data="t_submit")])
+    return kb
 
 
 # ===================== FREE TESTS =====================
@@ -1790,9 +1900,11 @@ async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
         return await callback.message.answer("Avval /start orqali ro‘yxatdan o‘ting.")
 
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT 1 FROM results WHERE user_id=? AND test_id=? LIMIT 1", (user_db_id, test_id)) as cur:
+        async with db.execute("SELECT 1 FROM results WHERE user_id=? AND test_id=? LIMIT 1",
+                              (user_db_id, test_id)) as cur:
             if await cur.fetchone():
-                return await callback.message.answer("⚠️ Siz bu testni allaqachon topshirgansiz. Qayta topshirib bo‘lmaydi.")
+                return await callback.message.answer(
+                    "⚠️ Siz bu testni allaqachon topshirgansiz. Qayta topshirib bo‘lmaydi.")
 
         async with db.execute("""
             SELECT code, title, file_id, duration, questions_count, answers, start_mode, start_ts, start_at
@@ -1823,11 +1935,13 @@ async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
     answer_key = normalize_answers(answers)
     if len(answer_key) != int(qcount):
-        return await callback.message.answer("⚠️ Admin testni xato qo‘shgan: javob kaliti uzunligi savol soniga teng emas.")
+        return await callback.message.answer(
+            "⚠️ Admin testni xato qo‘shgan: javob kaliti uzunligi savol soniga teng emas.")
 
     cancel_timer(callback.from_user.id, test_id)
 
-    start_ts_ = int(start_ts_val) if (start_mode or "normal") == "scheduled" and int(start_ts_val or 0) > 0 else now_ts()
+    start_ts_ = int(start_ts_val) if (start_mode or "normal") == "scheduled" and int(
+        start_ts_val or 0) > 0 else now_ts()
     duration_sec = int(duration_min) * 60
     end_ts_ = start_ts_ + duration_sec
 
@@ -1858,19 +1972,17 @@ async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
         start_countdown(bot, callback.from_user.id, test_id, end_ts_, timer_msg.message_id)
     )
 
-    await state.update_data(test_id=test_id, mode="free")
+    await state.update_data(test_id=test_id, mode="free", qcount=qcount, current_q=1, test_answers={})
     await bot.send_message(
         chat_id=callback.from_user.id,
         text=(
-            f"⏱ <b>Test boshlandi!</b>\n"
-            f"🔑 Kod: <code>{code}</code>\n"
-            f"🧮 Savollar: <b>{qcount}</b>\n\n"
-            f"Javob format: <code>abcd...</code> (bo‘sh joysiz)\n"
-            f"⚠️ Faqat 1-urinish qabul qilinadi.\n"
-            f"⚠️ Javoblar soni aniq <b>{qcount}</b> ta bo‘lishi shart."
+            f"📝 <b>Test boshlandi!</b>\n\n"
+            f"Savol: <b>1 / {qcount}</b>\n"
+            f"Pastdagi tugmalar orqali javoblarni interaktiv belgilang.\n"
+            f"<i>(Yoki xohlasangiz odatdagidek abcd... formatida birdaniga yozib yuboring)</i>"
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=nav_kb(include_back=True)
+        reply_markup=test_ui_kb(1, int(qcount), {})
     )
     await state.set_state(TestProcessState.solving)
 
@@ -1956,11 +2068,13 @@ async def show_paid_tests(message: Message):
         text += "\n"
 
         if st == "approved":
-            kb.inline_keyboard.append([InlineKeyboardButton(text=f"📦 Mening testlarim: {code}", callback_data="open_mytests")])
+            kb.inline_keyboard.append(
+                [InlineKeyboardButton(text=f"📦 Mening testlarim: {code}", callback_data="open_mytests")])
         elif st == "pending":
             kb.inline_keyboard.append([InlineKeyboardButton(text=f"🟡 Pending: {code}", callback_data=f"payinfo_{tid}")])
         elif st == "rejected":
-            kb.inline_keyboard.append([InlineKeyboardButton(text=f"♻️ Qayta to'lov: {code}", callback_data=f"rebuy_{tid}")])
+            kb.inline_keyboard.append(
+                [InlineKeyboardButton(text=f"♻️ Qayta to'lov: {code}", callback_data=f"rebuy_{tid}")])
         else:
             kb.inline_keyboard.append([InlineKeyboardButton(text=f"Sotib olish: {code}", callback_data=f"buy_{tid}")])
 
@@ -2019,7 +2133,8 @@ async def start_payment(callback: CallbackQuery, state: FSMContext, bot: Bot):
             LIMIT 1
         """, (user_db_id, test_id)) as cur:
             if await cur.fetchone():
-                return await callback.message.answer("🟡 Sizda shu test bo‘yicha pending to‘lov bor. Admin javobini kuting.")
+                return await callback.message.answer(
+                    "🟡 Sizda shu test bo‘yicha pending to‘lov bor. Admin javobini kuting.")
 
     await state.update_data(test_id=test_id)
     await callback.message.answer(
@@ -2077,7 +2192,8 @@ async def rebuy(callback: CallbackQuery, state: FSMContext, bot: Bot):
             LIMIT 1
         """, (user_db_id, test_id)) as cur:
             if await cur.fetchone():
-                return await callback.message.answer("🟡 Sizda shu test bo‘yicha pending to‘lov bor. Admin javobini kuting.")
+                return await callback.message.answer(
+                    "🟡 Sizda shu test bo‘yicha pending to‘lov bor. Admin javobini kuting.")
 
     await state.update_data(test_id=test_id)
     await callback.message.answer(
@@ -2142,7 +2258,6 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
                 await message.answer("🟡 Sizda shu test bo‘yicha pending to‘lov bor.")
                 await state.clear()
                 return
-
 
         cur = await db.execute("""
             INSERT INTO payments (user_id, test_id, screenshot_id, status, created_at)
@@ -2263,12 +2378,15 @@ async def my_tests(message: Message):
         if status == "approved":
             if first_percent is not None:
                 text += f"✅ Natija: <b>{float(first_percent):.1f}%</b> (1-urinish)\n\n"
-                actions.inline_keyboard.append([InlineKeyboardButton(text=f"📄 Natija: {code}", callback_data=f"viewres_{test_id}")])
+                actions.inline_keyboard.append(
+                    [InlineKeyboardButton(text=f"📄 Natija: {code}", callback_data=f"viewres_{test_id}")])
                 if started_at_paid:
-                    actions.inline_keyboard.append([InlineKeyboardButton(text=f"📄 PDF: {code}", callback_data=f"pdf_{test_id}")])
+                    actions.inline_keyboard.append(
+                        [InlineKeyboardButton(text=f"📄 PDF: {code}", callback_data=f"pdf_{test_id}")])
             else:
                 text += "✅ Tasdiqlangan (hali yechilmagan)\n\n"
-                actions.inline_keyboard.append([InlineKeyboardButton(text=f"🚀 Boshlash: {code}", callback_data=f"begin_{payment_id}")])
+                actions.inline_keyboard.append(
+                    [InlineKeyboardButton(text=f"🚀 Boshlash: {code}", callback_data=f"begin_{payment_id}")])
 
         elif status == "pending":
             text += "🟡 Pending\n\n"
@@ -2277,7 +2395,8 @@ async def my_tests(message: Message):
             if reject_reason:
                 text += f" — {reject_reason}"
             text += "\n\n"
-            actions.inline_keyboard.append([InlineKeyboardButton(text=f"♻️ Qayta to‘lov: {code}", callback_data=f"rebuy_{test_id}")])
+            actions.inline_keyboard.append(
+                [InlineKeyboardButton(text=f"♻️ Qayta to‘lov: {code}", callback_data=f"rebuy_{test_id}")])
         else:
             text += "ℹ️ Noma’lum holat\n\n"
 
@@ -2339,7 +2458,7 @@ async def view_result(callback: CallbackQuery):
     if not row:
         return await callback.message.answer("Bu test bo‘yicha natija topilmadi.")
 
-    (code, title, subject,is_free, price, exam_type,
+    (code, title, subject, is_free, price, exam_type,
      score, total, percent,
      earned_points, max_points, details_json,
      rasch_ball, rasch_percent, grade, date_) = row
@@ -2439,7 +2558,6 @@ async def view_result(callback: CallbackQuery):
     )
 
 
-
 # ===================== PAID TEST BEGIN =====================
 @router.callback_query(F.data.startswith("begin_"))
 async def begin_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
@@ -2488,17 +2606,21 @@ async def begin_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
         )
 
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT 1 FROM results WHERE user_id=? AND test_id=? LIMIT 1", (user_db_id, test_id)) as cur:
+        async with db.execute("SELECT 1 FROM results WHERE user_id=? AND test_id=? LIMIT 1",
+                              (user_db_id, test_id)) as cur:
             if await cur.fetchone():
-                return await callback.message.answer("⚠️ Siz bu testni allaqachon topshirgansiz. Qayta topshirib bo‘lmaydi.")
+                return await callback.message.answer(
+                    "⚠️ Siz bu testni allaqachon topshirgansiz. Qayta topshirib bo‘lmaydi.")
 
     answer_key = normalize_answers(answers)
     if len(answer_key) != int(qcount):
-        return await callback.message.answer("⚠️ Admin testni xato qo‘shgan: javob kaliti uzunligi savol soniga teng emas.")
+        return await callback.message.answer(
+            "⚠️ Admin testni xato qo‘shgan: javob kaliti uzunligi savol soniga teng emas.")
 
     cancel_timer(callback.from_user.id, test_id)
 
-    exam_start_ts = int(start_ts_val) if (start_mode or "normal") == "scheduled" and int(start_ts_val or 0) > 0 else now_ts()
+    exam_start_ts = int(start_ts_val) if (start_mode or "normal") == "scheduled" and int(
+        start_ts_val or 0) > 0 else now_ts()
     duration_sec = int(duration_min) * 60
     end_ts_ = exam_start_ts + duration_sec
 
@@ -2507,7 +2629,8 @@ async def begin_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
     if not started_ts_paid:
         async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE payments SET started_at=?, started_ts=? WHERE id=?", (now_str_local(), now_ts(), payment_id))
+            await db.execute("UPDATE payments SET started_at=?, started_ts=? WHERE id=?",
+                             (now_str_local(), now_ts(), payment_id))
             await db.commit()
 
     await upsert_session(user_db_id, test_id, "paid", exam_start_ts, duration_sec)
@@ -2534,19 +2657,17 @@ async def begin_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
         start_countdown(bot, callback.from_user.id, test_id, end_ts_, timer_msg.message_id)
     )
 
-    await state.update_data(test_id=test_id, mode="paid")
+    await state.update_data(test_id=test_id, mode="paid", qcount=qcount, current_q=1, test_answers={})
     await bot.send_message(
         chat_id=callback.from_user.id,
         text=(
-            f"⏱ <b>Javoblarni yuboring</b>\n\n"
-            f"🔑 Kod: <code>{code}</code>\n"
-            f"🧮 Savollar: <b>{qcount}</b>\n\n"
-            f"Javob format: <code>abcd...</code>\n"
-            f"⚠️ Faqat 1-urinish.\n"
-            f"⚠️ Javoblar soni aniq <b>{qcount}</b> ta bo‘lishi shart."
+            f"📝 <b>Test boshlandi!</b>\n\n"
+            f"Savol: <b>1 / {qcount}</b>\n"
+            f"Pastdagi tugmalar orqali javoblarni interaktiv belgilang.\n"
+            f"<i>(Yoki xohlasangiz odatdagidek abcd... formatida birdaniga yozib yuboring)</i>"
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=nav_kb(include_back=True)
+        reply_markup=test_ui_kb(1, int(qcount), {})
     )
     await state.set_state(TestProcessState.solving)
 
@@ -2580,15 +2701,11 @@ async def check_paid_start(callback: CallbackQuery):
     await callback.message.answer("✅ Boshlash vaqti keldi! Endi 'Boshlash' tugmasini bosing.")
 
 
-# ===================== SUBMIT ANSWERS (FREE+PAID) =====================
-@router.message(TestProcessState.solving)
-async def submit_answers(message: Message, state: FSMContext):
-    if (message.text or "") in TOP_MENU_BTNS:
-        return
-
-    user_db_id = await get_user_db_id(message.from_user.id)
+# ===================== INTERACTIVE & TEXT SUBMISSION LOGIC =====================
+async def process_test_submission(user_tg_id: int, bot: Bot, state: FSMContext, user_ans: str):
+    user_db_id = await get_user_db_id(user_tg_id)
     if not user_db_id:
-        await message.answer("Avval /start orqali ro‘yxatdan o‘ting.")
+        await bot.send_message(user_tg_id, "Avval /start orqali ro‘yxatdan o‘ting.")
         await state.clear()
         return
 
@@ -2598,26 +2715,28 @@ async def submit_answers(message: Message, state: FSMContext):
 
     sess = await get_session(user_db_id, test_id, mode)
     if not sess:
-        await message.answer("⚠️ Sessiya topilmadi. Testni qayta boshlang.")
-        cancel_timer(message.from_user.id, test_id)
+        await bot.send_message(user_tg_id, "⚠️ Sessiya topilmadi. Testni qayta boshlang.")
+        cancel_timer(user_tg_id, test_id)
         await state.clear()
         return
 
     start_ts_, duration_sec = sess
     end_ts_ = int(start_ts_) + int(duration_sec)
     if now_ts() > end_ts_ + 60:
-        await message.answer("❌ Vaqt tugadi! Javoblar qabul qilinmadi.")
+        await bot.send_message(user_tg_id, "❌ Vaqt tugadi! Javoblar qabul qilinmadi.")
         await delete_session(user_db_id, test_id, mode)
-        cancel_timer(message.from_user.id, test_id)
+        cancel_timer(user_tg_id, test_id)
         await state.clear()
         return
 
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT 1 FROM results WHERE user_id=? AND test_id=? LIMIT 1", (user_db_id, test_id)) as cur:
+        async with db.execute("SELECT 1 FROM results WHERE user_id=? AND test_id=? LIMIT 1",
+                              (user_db_id, test_id)) as cur:
             if await cur.fetchone():
-                await message.answer("⚠️ Siz bu testni allaqachon topshirgansiz. Qayta topshirib bo‘lmaydi.")
+                await bot.send_message(user_tg_id,
+                                       "⚠️ Siz bu testni allaqachon topshirgansiz. Qayta topshirib bo‘lmaydi.")
                 await delete_session(user_db_id, test_id, mode)
-                cancel_timer(message.from_user.id, test_id)
+                cancel_timer(user_tg_id, test_id)
                 await state.clear()
                 return
 
@@ -2625,37 +2744,23 @@ async def submit_answers(message: Message, state: FSMContext):
             SELECT code, title, subject, questions_count, answers, exam_type, dtm_cfg, start_mode, start_ts, duration
             FROM tests
             WHERE id=?
-
         """, (test_id,)) as cur:
             t = await cur.fetchone()
 
     if not t:
-        await message.answer("Test topilmadi.")
+        await bot.send_message(user_tg_id, "Test topilmadi.")
         await delete_session(user_db_id, test_id, mode)
-        cancel_timer(message.from_user.id, test_id)
+        cancel_timer(user_tg_id, test_id)
         await state.clear()
         return
 
     code, title, subject, qcount, answer_key_raw, exam_type, dtm_cfg, start_mode, start_ts_val, duration_min = t
-
     qcount = int(qcount)
     correct_key = normalize_answers(answer_key_raw)
 
-    if len(correct_key) != qcount:
-        await message.answer("⚠️ Test javob kaliti xato. Admin bilan bog‘laning.")
-        await delete_session(user_db_id, test_id, mode)
-        cancel_timer(message.from_user.id, test_id)
-        await state.clear()
-        return
-
-    user_ans = normalize_answers(message.text)
-
-    if not is_answer_string_valid(user_ans):
-        await message.answer("⚠️ Javoblar faqat harflardan iborat bo‘lsin. Masalan: <code>abcd...</code>", parse_mode=ParseMode.HTML)
-        return
-
     if len(user_ans) != qcount:
-        await message.answer(
+        await bot.send_message(
+            user_tg_id,
             f"⚠️ Javoblar soni noto‘g‘ri.\n"
             f"Kerakli: <b>{qcount}</b>, Siz yubordingiz: <b>{len(user_ans)}</b>.\n\n"
             f"Iltimos, aniq <b>{qcount} ta</b> javob yuboring.",
@@ -2669,7 +2774,8 @@ async def submit_answers(message: Message, state: FSMContext):
         if user_ans[i] == correct_key[i]:
             score += 1
         else:
-            mistakes.append(f"{i+1}-savol: siz={user_ans[i]} | to‘g‘ri={correct_key[i]}")
+            miss_char = "Belgilangan: yo'q" if user_ans[i] == "*" else f"Siz: {user_ans[i]}"
+            mistakes.append(f"{i + 1}-savol: {miss_char} | to‘g‘ri={correct_key[i]}")
 
     percent = (score / qcount) * 100
 
@@ -2677,13 +2783,12 @@ async def submit_answers(message: Message, state: FSMContext):
     max_points = float(qcount)
     details = None
 
-    # ✅ DTM bo'lsa ball bo'yicha hisoblaymiz
     if (exam_type or "simple") == "dtm":
         earned_points, max_points, details_obj = dtm_score_points(user_ans, correct_key, dtm_cfg or "")
         details = json.dumps(details_obj, ensure_ascii=False)
         percent_points = (earned_points / max_points) * 100 if max_points > 0 else 0.0
     else:
-        percent_points = percent  # oddiyda bir xil
+        percent_points = percent
 
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -2698,15 +2803,14 @@ async def submit_answers(message: Message, state: FSMContext):
         """, (
             user_db_id, test_id,
             score, qcount,
-            float(percent_points),  # ✅ DTMda ball foiz, oddiyda oddiy foiz
+            float(percent_points),
             user_ans,
             float(earned_points), float(max_points), details,
             now_ts(),
             now_str_local()
         ))
-
         await db.commit()
-    # ✅ CERTIFICATE: immediate only for normal + (simple/dtm) and eligible
+
     et = (exam_type or "simple")
     can_immediate = ((start_mode or "normal") == "normal") and (et in ("simple", "dtm"))
     if can_immediate:
@@ -2729,15 +2833,17 @@ async def submit_answers(message: Message, state: FSMContext):
                     test_code=test_code,
                     test_title=test_title,
                     exam_date_str=exam_date,
+                    percent=float(percent_points),
+                    correct_count=score,
+                    total_questions=qcount,
                     out_path=pdf_path
                 )
 
-                sent = await message.bot.send_document(
-                    chat_id=message.from_user.id,
+                sent = await bot.send_document(
+                    chat_id=user_tg_id,
                     document=FSInputFile(pdf_path),
                     caption="🎁 Sertifikatingiz tayyor! (PDF)"
                 )
-
                 cert_file_id = sent.document.file_id if sent and sent.document else None
                 async with aiosqlite.connect(DB_NAME) as db2:
                     await db2.execute("""
@@ -2746,13 +2852,11 @@ async def submit_answers(message: Message, state: FSMContext):
                         WHERE user_id=? AND test_id=?
                     """, (cert_file_id, now_ts(), user_db_id, test_id))
                     await db2.commit()
-
-            except Exception as e:
-                # xohlasangiz log qiling
+            except Exception:
                 pass
 
     await delete_session(user_db_id, test_id, mode)
-    cancel_timer(message.from_user.id, test_id)
+    cancel_timer(user_tg_id, test_id)
     await state.clear()
 
     mistakes_text = "\n".join(mistakes[:25])
@@ -2776,7 +2880,6 @@ async def submit_answers(message: Message, state: FSMContext):
             "📌 Rasch ball ko‘rish uchun: <b>“📄 Natijani ko‘rish”</b> tugmasini bosing.\n"
         )
 
-
     result_text = (
         f"🏁 <b>Test yakunlandi!</b>\n\n"
         f"🔑 Kod: <code>{code}</code>\n"
@@ -2791,19 +2894,121 @@ async def submit_answers(message: Message, state: FSMContext):
         f"{mistakes_text if mistakes_text else 'Xatolar yo‘q ✅'}\n\n"
         f"ℹ️ Bu test bo‘yicha natija faqat <b>1-urinish</b> hisoblanadi."
     )
+    # Adminga ogohlantirish va testni yopish tugmasi
+    admin_msg = (
+        f"🔔 <b>Yangi test yechildi!</b>\n\n"
+        f"👤 O'quvchi: <b>{await get_user_full_name(user_db_id)}</b>\n"
+        f"🔑 Test kodi: <code>{code}</code>\n"
+        f"📚 Test nomi: {title}\n"
+        f"📊 Natija: {score}/{qcount}  (<b>{percent:.1f}%</b>)"
+    )
+    admin_close_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Ushbu testni yakunlash (Yopish)", callback_data=f"forceclose_{test_id}")]
+    ])
+    try:
+        await bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.HTML, reply_markup=admin_close_kb)
+    except Exception:
+        pass
 
-    # ✅ Natijani ko‘rish tugmasi (test yakunlangach darhol)
+    # Asosiy tugma (foydalanuvchi uchun)
     res_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📄 Natijani ko‘rish", callback_data=f"viewres_{test_id}")]
     ])
 
-    admin_flag = await is_admin_user(message.from_user.id)
-    await message.answer(
-        result_text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=res_kb
-    )
-    await message.answer("🏠 Bosh menyu", reply_markup=main_menu_kb(admin_flag))
+    admin_flag = await is_admin_user(user_tg_id)
+    await bot.send_message(user_tg_id, result_text, parse_mode=ParseMode.HTML, reply_markup=res_kb)
+    await bot.send_message(user_tg_id, "🏠 Bosh menyu", reply_markup=main_menu_kb(admin_flag))
+
+
+# Eski matn (Text) qabul qilish formati uchun
+@router.message(TestProcessState.solving)
+async def submit_answers_text(message: Message, state: FSMContext, bot: Bot):
+    if (message.text or "") in TOP_MENU_BTNS: return
+    user_ans = normalize_answers(message.text)
+
+    if not is_answer_string_valid(user_ans):
+        await message.answer("⚠️ Javoblar faqat harflardan iborat bo‘lsin. Masalan: <code>abcd...</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    await process_test_submission(message.from_user.id, bot, state, user_ans)
+
+
+# Yangi interaktiv (Tugma) formati uchun
+@router.callback_query(TestProcessState.solving, F.data.startswith("t_"))
+async def interactive_test_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    current_q = data.get("current_q", 1)
+    qcount = int(data.get("qcount", 30))
+    answers = data.get("test_answers", {})
+
+    action = callback.data
+
+    if action == "t_nav_noop":
+        return await callback.answer(f"Siz hozir {current_q}-savoldasiz", show_alert=False)
+
+    elif action.startswith("t_ans_"):
+        ans_letter = action.split("_")[2]
+        answers[str(current_q)] = ans_letter
+        await state.update_data(test_answers=answers)
+
+        # Javoblangach keyingi savolga avtomat sakrash
+        if current_q < qcount:
+            current_q += 1
+            await state.update_data(current_q=current_q)
+            try:
+                await callback.message.edit_text(
+                    text=f"📝 <b>Test davom etmoqda...</b>\n\nSavol: <b>{current_q} / {qcount}</b>\nPastdagi tugmalar orqali javobni belgilang:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=test_ui_kb(current_q, qcount, answers)
+                )
+            except Exception:
+                pass
+        else:
+            # Agar eng oxirgi savolda bo'lsa, joyida qoladi faqat tugma rangi o'zgaradi
+            try:
+                await callback.message.edit_reply_markup(reply_markup=test_ui_kb(current_q, qcount, answers))
+            except Exception:
+                pass
+
+        await callback.answer()
+
+    elif action == "t_nav_prev":
+        if current_q > 1:
+            current_q -= 1
+            await state.update_data(current_q=current_q)
+            try:
+                await callback.message.edit_text(
+                    text=f"📝 <b>Test davom etmoqda...</b>\n\nSavol: <b>{current_q} / {qcount}</b>\nPastdagi tugmalar orqali javobni belgilang:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=test_ui_kb(current_q, qcount, answers)
+                )
+            except Exception:
+                pass
+        await callback.answer()
+
+    elif action == "t_nav_next":
+        if current_q < qcount:
+            current_q += 1
+            await state.update_data(current_q=current_q)
+            try:
+                await callback.message.edit_text(
+                    text=f"📝 <b>Test davom etmoqda...</b>\n\nSavol: <b>{current_q} / {qcount}</b>\nPastdagi tugmalar orqali javobni belgilang:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=test_ui_kb(current_q, qcount, answers)
+                )
+            except Exception:
+                pass
+        await callback.answer()
+
+    elif action == "t_submit":
+        user_ans = ""
+        for i in range(1, qcount + 1):
+            user_ans += answers.get(str(i), "*")  # Belgilanmaganlari "*" bo'lib o'tadi
+
+        await callback.message.delete_reply_markup()
+        await callback.answer("Javoblaringiz qabul qilindi, baholanmoqda...", show_alert=False)
+        await process_test_submission(callback.from_user.id, bot, state, user_ans)
 
 
 # ===================== RESULTS MENU =====================
@@ -2894,7 +3099,7 @@ async def rating_overall(callback: CallbackQuery):
 
     text = "<b>🏆 Umumiy reyting (TOP)</b>\n(1-urinish natijalari bo‘yicha o‘rtacha %)\n\n"
     for i, (uid, avg, c) in enumerate(leaderboard[:TOP_N], start=1):
-        text += f"{i}) {names.get(uid,'Noma’lum')} — <b>{avg:.1f}%</b> (testlar: {c})\n"
+        text += f"{i}) {names.get(uid, 'Noma’lum')} — <b>{avg:.1f}%</b> (testlar: {c})\n"
 
     my_rank = None
     my_avg = None
@@ -2939,7 +3144,7 @@ async def rating_weekly(callback: CallbackQuery):
     leaderboard = sorted([(uid, pct) for uid, pct in best.items()], key=lambda x: x[1], reverse=True)
     text = "<b>📅 Haftalik TOP (7 kun)</b>\n(1-urinish natijalari)\n\n"
     for i, (uid, pct) in enumerate(leaderboard[:TOP_N], start=1):
-        text += f"{i}) {names.get(uid,'Noma’lum')} — <b>{pct:.1f}%</b>\n"
+        text += f"{i}) {names.get(uid, 'Noma’lum')} — <b>{pct:.1f}%</b>\n"
 
     await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -2957,15 +3162,14 @@ async def rating_tests_list(callback: CallbackQuery):
     for tid, code, title in tests:
         kb.inline_keyboard.append([InlineKeyboardButton(text=f"🔑 {code} — {title}", callback_data=f"rt_test_{tid}")])
 
-    await callback.message.answer("📚 <b>Test bo‘yicha reyting</b>\nTestni tanlang:", parse_mode=ParseMode.HTML, reply_markup=kb)
+    await callback.message.answer("📚 <b>Test bo‘yicha reyting</b>\nTestni tanlang:", parse_mode=ParseMode.HTML,
+                                  reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("rt_test_"))
 async def rating_per_test(callback: CallbackQuery):
-
     test_id = int(callback.data.split("_")[2])
 
-    # ✅ SHU YERGA QO‘SHING
     # ✅ finalize faqat Rasch test uchun
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT exam_type FROM tests WHERE id=?", (test_id,)) as cur:
@@ -3004,7 +3208,7 @@ async def rating_per_test(callback: CallbackQuery):
     leaderboard = sorted([(uid, float(pct)) for uid, pct in rows], key=lambda x: x[1], reverse=True)
     text = f"<b>🏆 Reyting: {title}</b>\n🔑 <code>{code}</code>\n(1-urinish)\n\n"
     for i, (uid, pct) in enumerate(leaderboard[:TOP_N], start=1):
-        text += f"{i}) {names.get(uid,'Noma’lum')} — <b>{pct:.1f}%</b>\n"
+        text += f"{i}) {names.get(uid, 'Noma’lum')} — <b>{pct:.1f}%</b>\n"
 
     await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -3260,6 +3464,7 @@ async def admin_stats(message: Message):
 
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
+
 @router.callback_query(F.data == "rasch_menu")
 async def rasch_menu(callback: CallbackQuery):
     if not await is_admin_user(callback.from_user.id):
@@ -3290,6 +3495,7 @@ async def rasch_menu(callback: CallbackQuery):
         reply_markup=kb
     )
 
+
 @router.callback_query(F.data == "xl_menu")
 async def xl_menu(callback: CallbackQuery):
     if not await is_admin_user(callback.from_user.id):
@@ -3306,14 +3512,23 @@ async def xl_menu(callback: CallbackQuery):
     for tid, code, title in tests:
         kb.inline_keyboard.append([InlineKeyboardButton(text=f"📤 {code} — {title}", callback_data=f"xl_{tid}")])
 
-    await callback.message.answer("📤 <b>Excel eksport</b>\nQaysi test bo‘yicha?", parse_mode=ParseMode.HTML, reply_markup=kb)
+    await callback.message.answer("📤 <b>Excel eksport</b>\nQaysi test bo‘yicha?", parse_mode=ParseMode.HTML,
+                                  reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("xl_"))
 async def xl_export(callback: CallbackQuery, bot: Bot):
-    if not await is_admin_user(callback.from_user.id):
-        return
     test_id = int(callback.data.split("_")[1])
+    user_tg_id = callback.from_user.id
+    is_admin = await is_admin_user(user_tg_id)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT creator_id FROM tests WHERE id=?", (test_id,)) as cur:
+            c_row = await cur.fetchone()
+    is_creator = c_row and c_row[0] == user_tg_id
+
+    if not (is_admin or is_creator):
+        return await callback.answer("Sizda ruxsat yo'q!", show_alert=True)
 
     # ✅ finalize faqat Rasch test uchun
     async with aiosqlite.connect(DB_NAME) as db:
@@ -3382,7 +3597,8 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
     ws_info.append(["StartAt", start_at or ""])
 
     ws_res = wb.create_sheet("Results")
-    ws_res.append(["FullName","Phone","TelegramID","Score","Total","Percent","RaschBall","RaschPercent","Grade","Date"])
+    ws_res.append(
+        ["FullName", "Phone", "TelegramID", "Score", "Total", "Percent", "RaschBall", "RaschPercent", "Grade", "Date"])
 
     for r in results:
         ws_res.append(list(r))
@@ -3413,12 +3629,21 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
         caption=f"📤 Excel eksport tayyor.\n🔑 <code>{code}</code> — <b>{title}</b>",
         parse_mode=ParseMode.HTML
     )
+
+
 @router.callback_query(F.data.startswith("raschrep_"))
 async def rasch_report_text(callback: CallbackQuery):
-    if not await is_admin_user(callback.from_user.id):
-        return
-
     test_id = int(callback.data.split("_")[1])
+    user_tg_id = callback.from_user.id
+    is_admin = await is_admin_user(user_tg_id)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT creator_id FROM tests WHERE id=?", (test_id,)) as cur:
+            c_row = await cur.fetchone()
+    is_creator = c_row and c_row[0] == user_tg_id
+
+    if not (is_admin or is_creator):
+        return await callback.answer("Sizda ruxsat yo'q!", show_alert=True)
 
     # finalize agar vaqti kelgan bo‘lsa
     await finalize_rush_for_test_if_ready(test_id)
@@ -3602,7 +3827,8 @@ async def ch_manage(callback: CallbackQuery):
             InlineKeyboardButton(text="🗑", callback_data=f"ch_del_{_id}")
         ])
 
-    await callback.message.answer("🧹 <b>Tahrirlash</b>\nON/OFF, ✏️ tahrirlash yoki 🗑 o‘chirish:", parse_mode=ParseMode.HTML, reply_markup=kb)
+    await callback.message.answer("🧹 <b>Tahrirlash</b>\nON/OFF, ✏️ tahrirlash yoki 🗑 o‘chirish:",
+                                  parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("ch_toggle_"))
@@ -3660,6 +3886,7 @@ async def ch_edit_start(callback: CallbackQuery, state: FSMContext):
         reply_markup=nav_kb(include_back=True)
     )
     await state.set_state(AdminChannelState.waiting_edit_payload)
+
 
 @router.message(AdminChannelState.waiting_edit_payload)
 async def ch_edit_save(message: Message, state: FSMContext):
@@ -3730,8 +3957,6 @@ async def ch_edit_save(message: Message, state: FSMContext):
     await message.answer("✅ Tahrirlandi.", reply_markup=main_menu_kb(True))
 
 
-
-
 DTM_DEFAULT_CFG = {
     "subjects": [
         {"name": "1-fan", "q": 30, "w": 3.1},
@@ -3742,8 +3967,11 @@ DTM_DEFAULT_CFG = {
     ]
 }
 
+
 def dtm_total_questions(cfg: dict) -> int:
     return sum(int(s["q"]) for s in cfg["subjects"])
+
+
 def dtm_score_points(user_ans: str, key: str, cfg_json: str) -> tuple[float, float, dict]:
     cfg = json.loads(cfg_json) if cfg_json else DTM_DEFAULT_CFG
     idx = 0
@@ -3754,8 +3982,8 @@ def dtm_score_points(user_ans: str, key: str, cfg_json: str) -> tuple[float, flo
     for s in cfg["subjects"]:
         q = int(s["q"])
         w = float(s["w"])
-        part_user = user_ans[idx:idx+q]
-        part_key = key[idx:idx+q]
+        part_user = user_ans[idx:idx + q]
+        part_key = key[idx:idx + q]
 
         correct = 0
         for i in range(q):
@@ -3781,11 +4009,22 @@ def dtm_score_points(user_ans: str, key: str, cfg_json: str) -> tuple[float, flo
     return earned, maxp, details
 
 
-# ===================== ADMIN: ADD TEST (DYNAMIC QCOUNT + SCHEDULE) =====================
-@router.message(F.text == BTN_ADMIN_ADD)
+# ===================== ALL USERS: ADD TEST =====================
+@router.message(F.text == BTN_ADD_TEST)
 async def admin_add_test(message: Message, state: FSMContext):
-    if not await is_admin_user(message.from_user.id):
-        return
+    is_admin = await is_admin_user(message.from_user.id)
+
+    if not is_admin:
+        # Kunlik limitni tekshirish
+        today_start = int(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT COUNT(*) FROM tests WHERE creator_id=? AND created_ts>=?",
+                                  (message.from_user.id, today_start)) as cur:
+                count = (await cur.fetchone())[0]
+        if count >= 10:
+            return await message.answer(
+                "⚠️ Siz bugun 10 ta test yaratdingiz. Kunlik limit (10 ta) tugadi! Ertaga yana urinib ko'ring.")
+
     await message.answer(
         "📚 <b>Test qaysi fan bo‘yicha?</b>\n"
         "Masalan: Matematika, Ingliz tili, Tarix, Ona tili...\n\n"
@@ -3795,20 +4034,31 @@ async def admin_add_test(message: Message, state: FSMContext):
     )
     await state.set_state(AdminAddTestState.subject)
 
-    @router.message(AdminAddTestState.subject)
-    async def set_subject(message: Message, state: FSMContext):
-        if (message.text or "") in TOP_MENU_BTNS:
-            return
-        subject = (message.text or "").strip()
-        if len(subject) < 2:
-            return await message.answer("⚠️ Fan nomi juda qisqa. Qayta kiriting:")
-        await state.update_data(subject=subject)
 
-        await message.answer(
-            "✅ Endi test nomini kiriting (masalan: DTM Blok 2024):",
-            reply_markup=nav_kb(include_back=True)
-        )
-        await state.set_state(AdminAddTestState.title)
+async def generate_unique_code():
+    async with aiosqlite.connect(DB_NAME) as db:
+        while True:
+            # T- bilan boshlanadigan 6 ta tasodifiy harf/raqamdan iborat kod yasaymiz
+            code = "T-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+            async with db.execute("SELECT 1 FROM tests WHERE code=?", (code,)) as cur:
+                if not await cur.fetchone():
+                    return code
+
+
+@router.message(AdminAddTestState.subject)
+async def set_subject(message: Message, state: FSMContext):
+    if (message.text or "") in TOP_MENU_BTNS:
+        return
+    subject = (message.text or "").strip()
+    if len(subject) < 2:
+        return await message.answer("⚠️ Fan nomi juda qisqa. Qayta kiriting:")
+    await state.update_data(subject=subject)
+
+    await message.answer(
+        "✅ Endi test nomini kiriting (masalan: DTM Blok 2024):",
+        reply_markup=nav_kb(include_back=True)
+    )
+    await state.set_state(AdminAddTestState.title)
 
 
 @router.message(AdminAddTestState.title)
@@ -3816,35 +4066,28 @@ async def set_title(message: Message, state: FSMContext):
     if (message.text or "") in TOP_MENU_BTNS:
         return
     await state.update_data(title=(message.text or "").strip())
-    await message.answer(
-        "🔑 <b>Test uchun UNIQUE KOD kiriting</b>\n"
-        "Masalan: <code>DTM24A</code>, <code>MS-001</code>, <code>FREE45</code>\n\n"
-        "Qoidalar: 3-20 belgi, faqat A-Z, 0-9, -, _",
-        parse_mode=ParseMode.HTML,
-        reply_markup=nav_kb(include_back=True)
-    )
-    await state.set_state(AdminAddTestState.code)
 
+    # Kodni o'zi avtomat generatsiya qiladi va saqlaydi
+    new_code = await generate_unique_code()
+    await state.update_data(code=new_code)
 
-@router.message(AdminAddTestState.code)
-async def set_code(message: Message, state: FSMContext):
-    if (message.text or "") in TOP_MENU_BTNS:
-        return
-    code = normalize_code(message.text)
-    if not is_valid_code(code):
-        await message.answer("⚠️ Kod formati noto‘g‘ri. Qayta kiriting:")
-        return
-    if await test_code_exists(code):
-        await message.answer("⚠️ Bu kod mavjud. Boshqa kod kiriting:")
-        return
-
-    await state.update_data(code=code)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🆓 Tekin test", callback_data="setfree_1")],
-        [InlineKeyboardButton(text="🧾 Pullik test", callback_data="setfree_0")]
-    ])
-    await message.answer("Test turi (to‘lov bo‘yicha):", reply_markup=kb)
-    await state.set_state(AdminAddTestState.is_free)
+    is_admin = await is_admin_user(message.from_user.id)
+    if is_admin:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆓 Tekin test", callback_data="setfree_1")],
+            [InlineKeyboardButton(text="🧾 Pullik test", callback_data="setfree_0")]
+        ])
+        await message.answer(
+            f"✅ Test kodi avtomatik yaratildi: <code>{new_code}</code>\n\nTest turi (to'lov bo'yicha):",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+        await state.set_state(AdminAddTestState.is_free)
+    else:
+        # Oddiy user faqat tekin test yarata oladi
+        await state.update_data(is_free=1)
+        await message.answer(
+            f"✅ Test kodi avtomatik yaratildi: <code>{new_code}</code>\n\n<i>Siz faqat tekin test yarata olasiz.</i>\n⏳ Vaqt limitini kiriting (daqiqada):",
+            parse_mode=ParseMode.HTML, reply_markup=nav_kb(include_back=True))
+        await state.set_state(AdminAddTestState.duration)
 
 
 @router.callback_query(F.data.startswith("setfree_"))
@@ -3853,10 +4096,12 @@ async def set_is_free(callback: CallbackQuery, state: FSMContext):
     await state.update_data(is_free=is_free)
 
     if is_free == 1:
-        await callback.message.answer("✅ Tekin test.\n⏳ Vaqt limitini kiriting (daqiqada):", reply_markup=nav_kb(include_back=True))
+        await callback.message.answer("✅ Tekin test.\n⏳ Vaqt limitini kiriting (daqiqada):",
+                                      reply_markup=nav_kb(include_back=True))
         await state.set_state(AdminAddTestState.duration)
     else:
-        await callback.message.answer("✅ Pullik test.\n💰 Narxni kiriting (so'm):", reply_markup=nav_kb(include_back=True))
+        await callback.message.answer("✅ Pullik test.\n💰 Narxni kiriting (so'm):",
+                                      reply_markup=nav_kb(include_back=True))
         await state.set_state(AdminAddTestState.price)
 
 
@@ -3907,6 +4152,7 @@ async def set_qcount(message: Message, state: FSMContext):
     await message.answer("Test rejimini tanlang:", reply_markup=kb)
     await state.set_state(AdminAddTestState.exam_type)
 
+
 @router.callback_query(F.data.startswith("etype_"))
 async def set_exam_type(callback: CallbackQuery, state: FSMContext):
     et = callback.data.split("_", 1)[1]  # simple/rasch/dtm
@@ -3941,6 +4187,7 @@ async def set_exam_type(callback: CallbackQuery, state: FSMContext):
     ])
     await callback.message.answer("Test boshlanish rejimi:", reply_markup=kb)
     await state.set_state(AdminAddTestState.schedule_mode)
+
 
 @router.callback_query(F.data == "sch_normal")
 async def schedule_normal(callback: CallbackQuery, state: FSMContext):
@@ -4015,9 +4262,6 @@ async def set_file(message: Message, state: FSMContext):
 
 @router.message(AdminAddTestState.answers)
 async def save_test(message: Message, state: FSMContext):
-    if not await is_admin_user(message.from_user.id):
-        await state.clear()
-        return
     if (message.text or "") in TOP_MENU_BTNS:
         return
 
@@ -4053,13 +4297,13 @@ async def save_test(message: Message, state: FSMContext):
             INSERT INTO tests (
                 code, title, subject, price, duration, questions_count, file_id, answers, is_free,
                 start_mode, start_ts, start_at,
-                exam_type, dtm_cfg
+                exam_type, dtm_cfg, creator_id, created_ts
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data.get("code"),
             data.get("title"),
-            data.get("subject"),  # ✅ NEW
+            data.get("subject"),
             price,
             int(data.get("duration") or 0),
             qcount,
@@ -4070,7 +4314,9 @@ async def save_test(message: Message, state: FSMContext):
             start_ts_val,
             start_at,
             exam_type,
-            dtm_cfg
+            dtm_cfg,
+            message.from_user.id,
+            now_ts()
         ))
 
         await db.commit()
@@ -4079,34 +4325,317 @@ async def save_test(message: Message, state: FSMContext):
     if start_mode == "scheduled":
         extra = f"\n📅 Boshlanish: <b>{start_at}</b>"
 
+    admin_flag = await is_admin_user(message.from_user.id)
     await message.answer(
         f"✅ Test qo‘shildi!\n🔑 Kod: <code>{data.get('code')}</code>\n🧮 Savollar: <b>{qcount}</b>{extra}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_kb(admin_flag)
+    )
+    await state.clear()
+
+
+# ===================== ALL USERS: MY CREATED TESTS =====================
+@router.message(F.text == BTN_MY_CREATED_TESTS)
+async def list_my_created_tests(message: Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT id, code, title, is_free, price, created_ts
+            FROM tests
+            WHERE creator_id=?
+            ORDER BY id DESC LIMIT 50
+        """, (message.from_user.id,)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        return await message.answer("Siz hali test yaratmagansiz.")
+
+    text = "🛠 <b>Siz yaratgan testlar:</b>\n\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    for tid, code, title, is_free, price, cts in rows:
+        kind = "🆓 Tekin" if is_free else f"🧾 {price} so'm"
+        text += f"🔑 <code>{code}</code> — <b>{title}</b> ({kind})\n\n"
+        kb.inline_keyboard.append(
+            [InlineKeyboardButton(text=f"📊 Statistika: {code}", callback_data=f"mycreatestat_{tid}")])
+
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("mycreatestat_"))
+async def creator_test_stat_cb(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[1])
+    user_tg_id = callback.from_user.id
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT code, title, exam_type, creator_id FROM tests WHERE id=?", (test_id,)) as cur:
+            t = await cur.fetchone()
+
+    if not t or t[3] != user_tg_id:
+        return await callback.answer("Bu test sizga tegishli emas!", show_alert=True)
+
+    code, title, exam_type, _ = t
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(DISTINCT user_id), AVG(percent), AVG(score) FROM results WHERE test_id=?",
+                              (test_id,)) as cur:
+            res = await cur.fetchone()
+
+    participants = res[0] if res and res[0] else 0
+    avg_pct = res[1] if res and res[1] else 0.0
+    avg_score = res[2] if res and res[2] else 0.0
+
+    text = (
+        f"📊 <b>Test statistikasi</b>\n\n"
+        f"🔑 Kod: <code>{code}</code>\n"
+        f"📚 Nomi: <b>{title}</b>\n\n"
+        f"👥 Qatnashuvchilar: <b>{participants}</b>\n"
+        f"📈 O'rtacha foiz: <b>{avg_pct:.1f}%</b>\n"
+        f"🎯 O'rtacha to'g'ri javob: <b>{avg_score:.1f}</b>\n"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Excel eksport", callback_data=f"xl_{test_id}")]
+    ])
+    if exam_type in ('rasch', 'maxsus'):
+        kb.inline_keyboard.append([InlineKeyboardButton(text="⚡ Rasch hisobot", callback_data=f"raschrep_{test_id}")])
+
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await callback.answer()
+
+
+# ===================== ADMIN: ADMIN VA TESTLARNI BOSHQARISH =====================
+@router.message(Command("addadmin"))
+async def add_admin_command(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Bunga faqat asosiy admin huquqli!")
+
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await message.answer("Format: <code>/addadmin Telegram_ID</code>\nMisol: /addadmin 123456789",
+                                    parse_mode=ParseMode.HTML)
+
+    target_id = int(parts[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET role='admin' WHERE telegram_id=?", (target_id,))
+        if db.total_changes == 0:
+            await db.execute("INSERT INTO users (telegram_id, role) VALUES (?, 'admin')", (target_id,))
+        await db.commit()
+
+    await message.answer(f"✅ <code>{target_id}</code> ID egasi admin qilib tayinlandi!", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("deladmin"))
+async def del_admin_command(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Bunga faqat asosiy admin huquqli!")
+
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await message.answer("Format: <code>/deladmin Telegram_ID</code>", parse_mode=ParseMode.HTML)
+
+    target_id = int(parts[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET role='student' WHERE telegram_id=?", (target_id,))
+        await db.commit()
+
+    await message.answer(f"✅ <code>{target_id}</code> ID egasidan adminlik olib tashlandi!", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("deltest"))
+async def del_test_command(message: Message):
+    if not await is_admin_user(message.from_user.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        return await message.answer("Format: <code>/deltest TEST_KODI</code>\nMisol: /deltest DTM24A",
+                                    parse_mode=ParseMode.HTML)
+
+    code = normalize_code(parts[1])
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, title FROM tests WHERE code=?", (code,)) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            return await message.answer(f"❌ <code>{code}</code> kodli test topilmadi.", parse_mode=ParseMode.HTML)
+
+        test_id, title = row
+
+        # Testni va unga bog'liq barcha ma'lumotlarni tozalash
+        await db.execute("DELETE FROM results WHERE test_id=?", (test_id,))
+        await db.execute("DELETE FROM payments WHERE test_id=?", (test_id,))
+        await db.execute("DELETE FROM sessions WHERE test_id=?", (test_id,))
+        await db.execute("DELETE FROM tests WHERE id=?", (test_id,))
+        await db.commit()
+
+    await message.answer(
+        f"✅ <b>Test muvaffaqiyatli o'chirildi!</b>\n\n"
+        f"🔑 Kod: <code>{code}</code>\n"
+        f"📚 Nomi: {title}\n\n"
+        f"<i>Ushbu testga tegishli barcha natijalar, kutilayotgan to'lovlar va sessiyalar ham tozalandi.</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ===================== ADMIN: ADMIN VA TESTLARNI BOSHQARISH (TUGMALAR) =====================
+
+async def admin_ask_del_test(message: Message, state: FSMContext):
+    if not await is_admin_user(message.from_user.id): return
+    await message.answer(
+        "🗑 <b>O'chirmoqchi bo'lgan test kodini kiriting:</b>\n\n"
+        "<i>Eslatma: Test bilan birga unga tegishli barcha natijalar va to'lovlar ham o'chib ketadi!</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=nav_kb(include_back=True)
+    )
+    await state.set_state(AdminManageState.waiting_test_code_to_del)
+
+
+@router.message(AdminManageState.waiting_test_code_to_del)
+async def process_del_test(message: Message, state: FSMContext):
+    if (message.text or "") in TOP_MENU_BTNS: return
+    code = normalize_code(message.text)
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, title FROM tests WHERE code=?", (code,)) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            return await message.answer(f"❌ <code>{code}</code> kodli test topilmadi. Qayta kiriting:",
+                                        parse_mode=ParseMode.HTML)
+
+        test_id, title = row
+        await db.execute("DELETE FROM results WHERE test_id=?", (test_id,))
+        await db.execute("DELETE FROM payments WHERE test_id=?", (test_id,))
+        await db.execute("DELETE FROM sessions WHERE test_id=?", (test_id,))
+        await db.execute("DELETE FROM tests WHERE id=?", (test_id,))
+        await db.commit()
+
+    await message.answer(
+        f"✅ <b>Test muvaffaqiyatli o'chirildi!</b>\n🔑 Kod: <code>{code}</code>\n📚 Nomi: {title}",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(True)
     )
     await state.clear()
 
 
+async def admin_ask_manage_admin(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Bunga faqat asosiy admin huquqli!")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👀 Adminlar ro'yxati", callback_data="admin_list")],
+        [InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="admin_add")],
+        [InlineKeyboardButton(text="➖ Adminni o'chirish", callback_data="admin_del")]
+    ])
+    await message.answer("👮 <b>Adminlarni boshqarish</b>\n\nQuyidagilardan birini tanlang:", parse_mode=ParseMode.HTML,
+                         reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_list")
+async def show_admin_list(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT telegram_id, full_name, phone FROM users WHERE role='admin'") as cur:
+            admins = await cur.fetchall()
+
+    text = "👮 <b>Adminlar ro'yxati:</b>\n\n"
+    text += f"👑 <b>Asosiy Admin (Siz):</b> <code>{ADMIN_ID}</code>\n\n"
+
+    if not admins:
+        text += "<i>Boshqa adminlar yo'q.</i>"
+    else:
+        for tg_id, fname, phone in admins:
+            name_str = fname if fname else "Noma'lum"
+            phone_str = phone if phone else "Noma'lum"
+            text += f"👤 Ism: <b>{name_str}</b>\n🆔 ID: <code>{tg_id}</code>\n📞 Tel: {phone_str}\n\n"
+
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"admin_add", "admin_del"}))
+async def admin_manage_cb(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return
+    action = callback.data
+    await state.update_data(admin_action=action)
+
+    act_text = "qo'shish" if action == "admin_add" else "o'chirish"
+    await callback.message.answer(
+        f"Foydalanuvchining <b>Telegram ID</b> raqamini yuboring (Adminni {act_text} uchun):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=nav_kb(include_back=True)
+    )
+    await state.set_state(AdminManageState.waiting_admin_id)
+
+
+@router.message(AdminManageState.waiting_admin_id)
+async def process_manage_admin(message: Message, state: FSMContext):
+    if (message.text or "") in TOP_MENU_BTNS: return
+    if not message.text.isdigit():
+        return await message.answer("Faqat raqam kiriting (Telegram ID):")
+
+    target_id = int(message.text)
+    data = await state.get_data()
+    action = data.get("admin_action")
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        if action == "admin_add":
+            await db.execute("UPDATE users SET role='admin' WHERE telegram_id=?", (target_id,))
+            if db.total_changes == 0:
+                await db.execute("INSERT INTO users (telegram_id, role) VALUES (?, 'admin')", (target_id,))
+            text = f"✅ <code>{target_id}</code> ID egasi admin qilib tayinlandi!"
+        else:
+            await db.execute("UPDATE users SET role='student' WHERE telegram_id=?", (target_id,))
+            text = f"✅ <code>{target_id}</code> ID egasidan adminlik olib tashlandi!"
+        await db.commit()
+
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(True))
+    await state.clear()
+
+
 # ===================== HELP =====================
 @router.message(F.text == BTN_HELP)
 async def help_menu(message: Message):
-    await message.answer(
-        "ℹ️ <b>Yordam</b>\n\n"
-        "🔎 Kod orqali test topish:\n"
-        "• 🧾 Pullik testlar → 'Kod orqali topish'\n"
-        "• 🆓 Tekin testlar → 'Kod orqali topish'\n"
-        "• 📦 Mening testlarim → 'Kod orqali topish'\n\n"
-        "✅ Har bir test bo‘yicha natija faqat <b>1-urinish</b> qabul qilinadi.\n"
-        "✅ Savollar soni nechta bo‘lsa, javob ham aynan shuncha bo‘lishi shart.\n\n"
-        "📅 Rejalashtirilgan test bo‘lsa, PDF faqat boshlanish vaqti kelganda beriladi.\n\n"
-        "🔐 Xavfsizlik: spam bo‘lsa vaqtincha blok beradi.\n"
-        "👤Admin: @jasur_aktamov\n"
-        "📞Admin: +998932244730\n"
-        f"🔁 Navigatsiya: {BTN_HOME} / {BTN_BACK}",
-        parse_mode=ParseMode.HTML
+    help_text = (
+        "📚 <b>BOTDAN FOYDALANISH YO'RIQNOMASI</b>\n\n"
+
+        "📞 <b>ALOQA:</b>\n"
+        "Muammolar bo'lsa yoki adminlik huquqini olish uchun murojaat qiling:\n"
+        "👤 Admin: @jasur_aktamov\n"
+        "📞 Telefon: +998 93 224 47 30\n"
+        "🔁 Navigatsiya: 🏠 Bosh menyu / ⬅️ Ortga\n\n"
+
+        "👨‍🎓 <b>O'QUVCHILAR UCHUN:</b>\n"
+        "<b>1. Test ishlash:</b>\n"
+        "• <b>🆓 Tekin testlar:</b> Barcha uchun ochiq testlar.\n"
+        "• <b>🧾 Pullik testlar:</b> Sotib olinadigan maxsus testlar.\n"
+        "<i>Testni \"Kod orqali topish\" tugmasi orqali tez topishingiz mumkin.</i>\n\n"
+
+        "<b>2. Test qoidalari:</b>\n"
+        "• Har bir testga faqat <b>1 marta</b> urinish beriladi.\n"
+        "• Javoblarni tugmalar orqali belgilashingiz yoki birdaniga matn shaklida (masalan: <code>abcd...</code>) yuborishingiz mumkin. Javoblar soni savollar soniga teng bo'lishi shart!\n"
+        "• 50% dan yuqori natija ko'rsatsangiz, avtomatik tarzda <b>Sertifikat (PDF)</b> beriladi 🎁.\n\n"
+
+        "<b>3. To'lov tizimi (Pullik testlar uchun):</b>\n"
+        "• Testni tanlab, \"Sotib olish\" tugmasini bosing.\n"
+        "• Karta raqamiga to'lov qilib, chekni (skrinshot) botga yuboring.\n"
+        "• Admin tasdiqlagach, testingiz <b>\"📦 Mening testlarim\"</b> bo'limida ochiladi.\n\n"
+
+        "<b>4. Reyting va Profil:</b>\n"
+        "• <b>📄 Natijalarim:</b> O'z natijalaringiz tarixi.\n"
+        "• <b>🏆 Reyting:</b> Umumiy va test bo'yicha kuchlilar o'nligi. Natijani ko'rish bo'limidan \"📊 Umumiy statistika (PDF)\" ni ham yuklab olishingiz mumkin.\n"
+        "• <b>👤 Profilim:</b> Ism-familiya va raqamni o'zgartirish.\n\n"
+
+        "➖ ➖ ➖ ➖ ➖ ➖ ➖ ➖\n\n"
+
     )
 
+    await message.answer(help_text, parse_mode=ParseMode.HTML)
+
+
 CERT_CHECK_EVERY_SEC = 30
+
 
 async def certificate_daemon(bot: Bot):
     while True:
@@ -4116,7 +4645,8 @@ async def certificate_daemon(bot: Bot):
                 async with db.execute("""
                     SELECT r.user_id, r.test_id, r.percent, r.grade, r.date,
                            u.telegram_id, u.full_name,
-                           t.code, t.title, t.subject, t.exam_type
+                           t.code, t.title, t.subject, t.exam_type,
+                           r.score, r.total_questions
                     FROM results r
                     JOIN users u ON u.id=r.user_id
                     JOIN tests t ON t.id=r.test_id
@@ -4128,7 +4658,7 @@ async def certificate_daemon(bot: Bot):
 
             for (user_id_db, test_id, pct, grade, date_str,
                  user_tg_id, full_name,
-                 tcode, ttitle, tsubject, exam_type) in rows:
+                 tcode, ttitle, tsubject, exam_type, score, total_q) in rows:
 
                 et = (exam_type or "simple")
 
@@ -4178,6 +4708,10 @@ async def certificate_daemon(bot: Bot):
                     test_code=tcode,
                     test_title=ttitle,
                     exam_date_str=(date_str or now_str_local()),
+                    percent=float(pct or 0.0),
+                    correct_count=int(score or 0),
+                    total_questions=int(total_q or 0),
+                    grade=grade,
                     out_path=pdf_path
                 )
 
@@ -4200,6 +4734,113 @@ async def certificate_daemon(bot: Bot):
             pass
 
         await asyncio.sleep(CERT_CHECK_EVERY_SEC)
+
+
+# ===================== TESTNI MAJBURIY YOPISH =====================
+@router.callback_query(F.data.startswith("forceclose_"))
+async def force_close_test(callback: CallbackQuery, bot: Bot):
+    test_id = int(callback.data.split("_")[1])
+    user_tg_id = callback.from_user.id
+
+    is_admin = await is_admin_user(user_tg_id)
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT creator_id FROM tests WHERE id=?", (test_id,)) as cur:
+            c_row = await cur.fetchone()
+
+    is_creator = c_row and c_row[0] == user_tg_id
+
+    if not (is_admin or is_creator):
+        return await callback.answer("Bu tugmani bosishga huquqingiz yo'q!", show_alert=True)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Testni muddatini o'tib ketgan qilib belgilaymiz (yangi user kirmasligi uchun)
+        await db.execute("UPDATE tests SET start_mode='scheduled', start_ts=1, duration=0 WHERE id=?", (test_id,))
+        await db.commit()
+
+        async with db.execute("SELECT code, exam_type FROM tests WHERE id=?", (test_id,)) as cur:
+            t = await cur.fetchone()
+
+    if t:
+        code, etype = t
+        etype = etype or "simple"
+        # Test yopilgan zahoti barcha natijalarni avtomat Rasch ga o'tkazib finalize qilamiz
+        if etype == "rasch":
+            await finalize_rush_for_test_if_ready(test_id)
+        elif etype == "maxsus":
+            await finalize_maxsus_for_test_if_ready(test_id)
+
+        await callback.message.edit_text(
+            callback.message.html_text + f"\n\n🛑 <b>Bu test admin tomonidan yakunlandi!</b> Boshqa o'quvchilar yecholmaydi.",
+            parse_mode=ParseMode.HTML
+        )
+        await callback.answer("Test muvaffaqiyatli yakunlandi va yopildi!", show_alert=True)
+
+
+# ===================== PROFILNI TAHRIRLASH =====================
+@router.message(F.text == BTN_PROFILE)
+async def profile_menu(message: Message, state: FSMContext):
+    user_db_id = await get_user_db_id(message.from_user.id)
+    if not user_db_id:
+        return await message.answer("Avval /start orqali ro'yxatdan o'ting.")
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT full_name, phone FROM users WHERE telegram_id=?", (message.from_user.id,)) as cur:
+            row = await cur.fetchone()
+
+    if not row: return
+    fname, phone = row
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Ism-familiyani o'zgartirish", callback_data="edit_prof_name")],
+        [InlineKeyboardButton(text="📱 Telefon raqamni o'zgartirish", callback_data="edit_prof_phone")]
+    ])
+
+    await message.answer(
+        f"👤 <b>Sizning profilingiz:</b>\n\n"
+        f"Ism: <b>{fname}</b>\n"
+        f"Telefon: <b>{phone}</b>\n\n"
+        f"O'zgartirish uchun pastdagi tugmalardan birini tanlang:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data.startswith("edit_prof_"))
+async def edit_profile_cb(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split("_")[2]
+    if action == "name":
+        await callback.message.answer("✏️ Yangi ism-familiyangizni kiriting:", reply_markup=nav_kb(include_back=True))
+        await state.set_state(EditProfileState.waiting_name)
+    else:
+        await callback.message.answer("📱 Yangi telefon raqamingizni yuboring:", reply_markup=phone_kb())
+        await state.set_state(EditProfileState.waiting_phone)
+    await callback.answer()
+
+
+@router.message(EditProfileState.waiting_name)
+async def edit_name_save(message: Message, state: FSMContext):
+    if (message.text or "") in TOP_MENU_BTNS: return
+    new_name = (message.text or "").strip()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET full_name=? WHERE telegram_id=?", (new_name, message.from_user.id))
+        await db.commit()
+    admin_flag = await is_admin_user(message.from_user.id)
+    await message.answer("✅ Ismingiz muvaffaqiyatli o'zgartirildi!", reply_markup=main_menu_kb(admin_flag))
+    await state.clear()
+
+
+@router.message(EditProfileState.waiting_phone)
+async def edit_phone_save(message: Message, state: FSMContext):
+    if (message.text or "") in TOP_MENU_BTNS: return
+    contact = message.contact.phone_number if message.contact else (message.text or "").strip()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET phone=? WHERE telegram_id=?", (contact, message.from_user.id))
+        await db.commit()
+    admin_flag = await is_admin_user(message.from_user.id)
+    await message.answer("✅ Raqamingiz muvaffaqiyatli o'zgartirildi!", reply_markup=main_menu_kb(admin_flag))
+    await state.clear()
+
+
 # ===================== MAIN =====================
 async def main():
     await init_db()
